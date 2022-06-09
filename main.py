@@ -1,0 +1,123 @@
+import argparse
+import torch
+import os
+from population import Population
+from evaluate import FitnessEvaluate
+from crossover_and_mutation import CrossoverAndMutation
+from selection import Selection
+from utils import Log
+import copy
+from sample import Sampler
+import numpy as np
+
+parser = argparse.ArgumentParser(description='Implementation of Evolutionary Graph Convolution Networks')
+# 数据集参数
+parser.add_argument('--dataset', type=str, default='Cora', help='Cora or CiteSeer or PubMed or PPI ...')
+parser.add_argument('--task_type', type=str, default='full', help='semi or full')
+parser.add_argument('--data_path', type=str, default='data')
+# 进化算法参数
+
+parser.add_argument('--pop_size', type=int, default=30)
+parser.add_argument('--max_gen', type=int, default=30)
+parser.add_argument('--max_len', type=int, default=20)
+parser.add_argument('--res_block_len', type=int, default=2)
+parser.add_argument('--dense_block_len', type=int, default=2)
+parser.add_argument('--incep_block_len', type=int, default=2)
+parser.add_argument('--pc', type=float, default=0.9, help='Crossover probability')
+parser.add_argument('--pm', type=float, default=0.2, help='Mutation probability')
+# 神经网络参数
+parser.add_argument('--total_epochs', type=int, default=400, help='number of total epochs to run')
+parser.add_argument('--seed', type=int, default=42, help='Random seed')
+# log保存参数
+parser.add_argument('--show', type=bool, default=True, help='show the training process')
+args = parser.parse_args()
+
+
+class EvoGCN(object):
+    def __init__(self, arg):
+        self.gen_no = 0
+        self.args = arg
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.fitness_records = {}
+        self.indi_fitness_records = []
+        self.genotype_records = []
+        self.ind_records = []
+        self.best_val2test = 0
+        self.best_fitness = 99999
+        self.best_genotype = ''
+        self.best_lr = 0.0
+        self.best_wd = 0.0
+        self.best_dropout = 0.0
+        self.best_hidden_dim = 0
+
+    def initialize_population(self):
+        self.sampler = Sampler(self.args.dataset, self.args.data_path, self.args.task_type)
+        self.num_node_features = self.sampler.nfeat
+        self.num_classes = self.sampler.nclass
+        pops = Population(self.args, self.num_node_features, self.num_classes, 0)
+        self.genotype_records, self.ind_records = pops.initialize(self.genotype_records, self.ind_records)
+        self.pops = pops  # 种群，其中个体包含：基因型（01）、表现型（网络）
+
+    def fitness_evaluate(self):
+        indi_no = 0
+        indi_fitness_record = []
+        for indi in self.pops.individuals:
+            fitness = FitnessEvaluate(indi, self.device, Log, self.sampler)
+            indi.fitness, self.best_fitness, self.best_genotype, self.fitness_records, self.best_lr, self.best_wd, self.best_dropout, self.best_val2test, self.best_hidden_dim = fitness.evaluate(
+                self.args, self.gen_no, indi_no, self.fitness_records, self.best_fitness, self.best_genotype,
+                self.best_lr,
+                self.best_wd, self.best_dropout, self.best_val2test, self.best_hidden_dim)
+            indi_no += 1
+            indi_fitness_record.append(indi.fitness)
+        self.indi_fitness_records.append(indi_fitness_record)
+
+    def crossover_and_mutation(self):
+        cm = CrossoverAndMutation(self.pops.individuals, self.args, self.num_node_features, self.num_classes,
+                                  self.gen_no, Log)
+        offsprings, self.genotype_records, self.ind_records = cm.process(self.genotype_records, self.ind_records)
+        self.parent_pops = copy.deepcopy(self.pops)
+        self.pops.individuals = copy.deepcopy(offsprings)
+
+    def environment_selection(self):
+        selection = Selection(self.parent_pops.individuals, self.pops.individuals)
+        next_individuals = selection.do_selection(self.args)
+        next_gen_pops = Population(self.args, self.num_node_features, self.num_classes, self.gen_no + 1)
+        next_gen_pops.create_from_offspring(next_individuals)
+        self.pops = next_gen_pops
+
+    def run(self):
+        Log.info('Initialize population ...')
+        self.initialize_population()
+        Log.info('Evolve {:02d}-gen. Begin to evaluate the fitness'.format(self.gen_no))
+        self.fitness_evaluate()
+        Log.info('The best fitness is {:.3f}, the corresponding acc_test={}, genotype={}, hidden_dim={}, dropout={}, lr={}, weight decay={}.'.format(
+                self.best_fitness, self.best_val2test, self.best_genotype, self.best_hidden_dim, self.best_dropout, self.best_lr, self.best_wd))
+        for cur_gen in range(1, self.args.max_gen):
+            self.gen_no = cur_gen
+            Log.info('Evolve {:02d}-gen. Begin to crossover and mutation'.format(self.gen_no))
+            self.crossover_and_mutation()
+            Log.info('Evolve {:02d}-gen. Begin to evaluate the fitness'.format(cur_gen))
+            self.fitness_evaluate()
+            Log.info('Evolve {:02d}-gen. Begin to the environment selection'.format(self.gen_no))
+            self.environment_selection()
+            Log.info('The best fitness is {:.3f}, the corresponding acc_test={}, genotype={}, hidden_dim={}, dropout={}, lr={}, weight decay={}.'.format(
+                    self.best_fitness, self.best_val2test, self.best_genotype, self.best_hidden_dim, self.best_dropout, self.best_lr, self.best_wd))
+
+        Log.info('{} individuals in total. Finish the evaluation.'.format(len(self.fitness_records.keys())))
+        # Log.info(self.indi_fitness_records)
+        # for key, value in self.fitness_records.items():
+        #     Log.info('\t{} : {}'.format(key, value))
+
+
+def main():
+    if os.path.exists('log.txt'):
+        os.remove('log.txt')
+    seed = np.random.randint(0, 10000)
+    args.seed = seed
+    Log.info('args = {}'.format(args))
+    evoGCN = EvoGCN(args)
+    evoGCN.run()
+
+
+if __name__ == '__main__':
+    main()
